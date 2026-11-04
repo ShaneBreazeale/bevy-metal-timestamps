@@ -1,0 +1,24 @@
+[package]
+name = "bevy_metal_timestamps"
+version = "0.1.0"
+edition = "2024"
+description = "Real per-frame GPU time for Bevy 0.20 on Metal (Apple GPUs) via pass-boundary timestamp queries"
+license = "MIT OR Apache-2.0"
+keywords = ["bevy", "metal", "gpu", "profiling", "timestamp"]
+categories = ["game-development", "development-tools::profiling"]
+
+[dependencies]
+bevy = { version = "0.20.0", default-features = false, features = ["bevy_render"] }
+# Same version Bevy 0.20 builds on, so these are Bevy's own wgpu types.
+wgpu = { version = "30.0.1", default-features = false, features = ["wgsl"] }
+
+[dev-dependencies]
+bevy = { version = "0.20.0" }
+
+[[example]]
+name = "stress"
+path = "examples/stress.rs"
+
+[[example]]
+name = "adapter_info"
+path = "examples/adapter_info.rs"
