@@ -97,6 +97,19 @@ impl GpuFrameTime {
         Some(sorted[i])
     }
 
+    /// Percentile `q` (0..=100) over only the most recent `last` frames —
+    /// for decisions that must follow a scene change quickly (frame pacing).
+    pub fn recent_percentile_ms(&self, q: f32, last: usize) -> Option<f32> {
+        let skip = self.history.len().saturating_sub(last.max(1));
+        let mut sorted: Vec<f32> = self.history.iter().skip(skip).copied().collect();
+        if sorted.is_empty() {
+            return None;
+        }
+        sorted.sort_by(f32::total_cmp);
+        let i = ((sorted.len() - 1) as f32 * (q / 100.0).clamp(0.0, 1.0)).round() as usize;
+        Some(sorted[i])
+    }
+
     pub fn p50_ms(&self) -> Option<f32> {
         self.percentile_ms(50.0)
     }
@@ -438,5 +451,9 @@ mod tests {
             gpu.push(1.0);
         }
         assert_eq!(gpu.history.len(), HISTORY);
+        // Recent window ignores the old samples.
+        gpu.push(9.0);
+        assert_eq!(gpu.recent_percentile_ms(100.0, 1), Some(9.0));
+        assert_eq!(gpu.recent_percentile_ms(50.0, 3), Some(1.0));
     }
 }
