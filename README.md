@@ -1,5 +1,9 @@
 # bevy_metal_timestamps
 
+[![Crates.io](https://img.shields.io/crates/v/bevy_metal_timestamps.svg)](https://crates.io/crates/bevy_metal_timestamps)
+[![Docs.rs](https://docs.rs/bevy_metal_timestamps/badge.svg)](https://docs.rs/bevy_metal_timestamps)
+[![License](https://img.shields.io/crates/l/bevy_metal_timestamps.svg)](#license)
+
 Real per-frame **GPU time** for [Bevy](https://bevyengine.org) 0.20 — including on
 **Metal / Apple silicon**, where Bevy's own render diagnostics report CPU time only.
 
@@ -56,12 +60,29 @@ well (p90 up in testing), so it is for profiling, not shipping.
 No Bevy fork, no Objective-C, no unsafe. Works anywhere wgpu reports `TIMESTAMP_QUERY` (Metal, Vulkan,
 DX12); without it the plugin logs once and does nothing.
 
-## Use
+## Install
+
+From [crates.io](https://crates.io/crates/bevy_metal_timestamps) ([API docs](https://docs.rs/bevy_metal_timestamps)):
+
+```sh
+cargo add bevy_metal_timestamps
+```
+
+or in `Cargo.toml`:
 
 ```toml
 [dependencies]
 bevy_metal_timestamps = "0.1"
 ```
+
+For per-stage time, turn on the `stages` feature (0.1.1 or later):
+
+```toml
+[dependencies]
+bevy_metal_timestamps = { version = "0.1.1", features = ["stages"] }
+```
+
+## Use
 
 ```rust
 use bevy::prelude::*;
@@ -72,6 +93,22 @@ App::new()
     .add_systems(Update, |gpu: Res<GpuFrameTime>| {
         if let (Some(p50), Some(p90)) = (gpu.p50_ms(), gpu.p90_ms()) {
             info!("GPU frame p50 {p50:.2} ms, p90 {p90:.2} ms");
+        }
+    })
+    .run();
+```
+
+With the `stages` feature, add `GpuStageTimesPlugin` beside it:
+
+```rust
+use bevy::prelude::*;
+use bevy_metal_timestamps::{GpuStageTimes, GpuStageTimesPlugin, GpuTimestampsPlugin, STAGE_NAMES};
+
+App::new()
+    .add_plugins((DefaultPlugins, GpuTimestampsPlugin, GpuStageTimesPlugin))
+    .add_systems(Update, |stages: Res<GpuStageTimes>| {
+        for (name, ms) in STAGE_NAMES.iter().zip(stages.mean_ms()) {
+            info!("{name}: {ms:.2} ms");
         }
     })
     .run();

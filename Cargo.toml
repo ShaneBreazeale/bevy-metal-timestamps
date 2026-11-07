@@ -1,6 +1,6 @@
 [package]
 name = "bevy_metal_timestamps"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Real per-frame GPU time for Bevy 0.20 on Metal (Apple GPUs) via pass-boundary timestamp queries"
 license = "MIT OR Apache-2.0"
@@ -10,6 +10,10 @@ readme = "README.md"
 exclude = ["rust-toolchain.toml", ".gitignore"]
 keywords = ["bevy", "metal", "gpu", "profiling", "timestamp"]
 categories = ["game-development", "development-tools::profiling"]
+
+[package.metadata.docs.rs]
+# Show the feature-gated API (GpuStageTimes, GpuStageTimesPlugin) on docs.rs.
+all-features = true
 
 [features]
 # Per-stage GPU time for 3D views: GpuStageTimesPlugin.
