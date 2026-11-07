@@ -8,20 +8,26 @@
 //!
 //! What Metal *does* support is a timestamp at the beginning or end of a pass,
 //! requested in the pass descriptor (`ComputePassTimestampWrites`). This crate
-//! brackets each frame with two tiny marker passes, each dispatching one no-op
-//! thread (Metal skips an empty pass, and a skipped pass samples nothing):
+//! brackets each frame with two tiny marker passes, each dispatching one thread
+//! (Metal skips an empty pass, and a skipped pass samples nothing):
 //!
-//! * a **begin marker** in [`RenderGraphSystems::Begin`] — the first command
-//!   buffer of the frame — writing the timestamp at the start of its pass;
+//! * a **begin marker** in [`RenderGraphSystems::Begin`], the first command
+//!   buffer of the frame;
 //! * an **end marker** after [`RenderGraphSystems::Render`] and before
-//!   [`RenderGraphSystems::Submit`] — the last command buffer — writing the
-//!   timestamp at the end of its pass.
+//!   [`RenderGraphSystems::Submit`], the last command buffer.
+//!
+//! A marker must DEPEND on the work it measures. Command buffers start in
+//! submission order but passes with no shared resource overlap freely, so a
+//! free-standing marker ran early: on a saturated GPU the end marker landed right
+//! after the begin marker and the frame read ~0 ms. Each marker therefore reads
+//! the view's main texture (hazard tracking waits for its writers), writes one
+//! shared buffer (which chains the markers in order), and samples at the END of
+//! its pass.
 //!
 //! The pair is resolved in the NEXT frame's first command buffer: on Metal an
 //! end-of-pass sample is not visible to a resolve in its own command buffer.
 //!
-//! Command buffers execute in submission order, so `end - begin` is the GPU
-//! time of everything the frame submitted in between. Readback is
+//! `end - begin` is then the GPU time of the frame. Readback is
 //! asynchronous over a ring of [`RING`] slots: measuring never stalls a frame,
 //! the value just arrives a few frames late. Frames are skipped while every
 //! slot is still in flight.
@@ -54,7 +60,13 @@ use bevy::prelude::*;
 use bevy::render::renderer::{
     PendingCommandBuffers, RenderDevice, RenderGraph, RenderGraphSystems, RenderQueue,
 };
+use bevy::render::view::ViewTarget;
 use bevy::render::RenderApp;
+
+#[cfg(feature = "stages")]
+mod stages;
+#[cfg(feature = "stages")]
+pub use stages::{GpuStageTimes, GpuStageTimesPlugin, STAGE_NAMES};
 
 /// Readback slots in flight. A slot's end sample is resolved one frame later
 /// (see [`collect_and_begin`]) and read back a few frames after that; eight
@@ -67,7 +79,7 @@ pub const HISTORY: usize = 240;
 /// Bevy diagnostic carrying each measured frame's GPU time (ms).
 pub const GPU_FRAME_TIME: DiagnosticPath = DiagnosticPath::const_new("gpu_frame_time");
 
-/// `QUERY_RESOLVE_BUFFER_ALIGNMENT`: each slot's resolved pair lives at a
+/// `QUERY_RESOLVE_BUFFER_ALIGNMENT`: each slot's resolved marks live at a
 /// multiple of this offset.
 const SLOT_STRIDE: u64 = wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT;
 
@@ -136,7 +148,13 @@ struct Shared(Arc<Mutex<SharedState>>);
 struct SharedState {
     supported: Option<bool>,
     samples: Vec<f32>,
+    #[cfg_attr(not(feature = "stages"), allow(dead_code))]
+    stages: Vec<Vec<f32>>,
 }
+
+/// Marks per frame beyond begin and end; set by `GpuStageTimesPlugin`.
+#[derive(Resource, Clone, Copy)]
+struct ExtraMarks(#[cfg_attr(not(feature = "stages"), allow(dead_code))] usize);
 
 const FREE: u8 = 0;
 /// Both markers encoded; the end sample is not resolvable yet.
@@ -157,10 +175,16 @@ struct Timer {
     query_set: wgpu::QuerySet,
     resolve: wgpu::Buffer,
     slots: Vec<Slot>,
-    /// One-thread no-op compute pipeline the marker passes dispatch. Metal
-    /// skips an EMPTY pass (no timestamps written), and a render pass without
-    /// draws only sometimes samples its end (it maps to end-of-fragment).
+    /// Marks per frame: begin, any stage marks, end.
+    marks: usize,
+    /// Marker pipelines: one thread reads a texel of the texture it waits on and
+    /// stores it in `sink`. Metal skips an EMPTY pass (no timestamps written).
     marker: wgpu::ComputePipeline,
+    #[cfg_attr(not(feature = "stages"), allow(dead_code))]
+    depth_marker: wgpu::ComputePipeline,
+    sink: wgpu::Buffer,
+    /// Bound when a frame has no view, so a marker still chains through `sink`.
+    fallback: wgpu::TextureView,
     /// Slot measuring the frame being recorded.
     current: Option<usize>,
     next: usize,
@@ -211,18 +235,19 @@ impl Plugin for GpuTimestampsPlugin {
             warn!("bevy_metal_timestamps: adapter has no TIMESTAMP_QUERY; GPU frame time unavailable");
             return;
         }
-        world.insert_resource(Timer::new(&device, &queue));
+        let marks = 2 + world.get_resource::<ExtraMarks>().map_or(0, |m| m.0);
+        world.insert_resource(Timer::new(&device, &queue, marks));
         info!("bevy_metal_timestamps: measuring GPU frame time ({RING} readback slots)");
     }
 }
 
 impl Timer {
-    fn new(device: &RenderDevice, queue: &RenderQueue) -> Self {
+    fn new(device: &RenderDevice, queue: &RenderQueue, marks: usize) -> Self {
         let device = device.wgpu_device();
         let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("bevy_metal_timestamps"),
             ty: wgpu::QueryType::Timestamp,
-            count: (RING * 2) as u32,
+            count: (RING * marks) as u32,
         });
         let resolve = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bevy_metal_timestamps_resolve"),
@@ -234,69 +259,153 @@ impl Timer {
             .map(|_| Slot {
                 readback: device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("bevy_metal_timestamps_readback"),
-                    size: 2 * wgpu::QUERY_SIZE as u64,
+                    size: marks as u64 * wgpu::QUERY_SIZE as u64,
                     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                     mapped_at_creation: false,
                 }),
                 state: Arc::new(AtomicU8::new(FREE)),
             })
             .collect();
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("bevy_metal_timestamps_marker"),
-            source: wgpu::ShaderSource::Wgsl("@compute @workgroup_size(1) fn main() {}".into()),
+        let sink = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bevy_metal_timestamps_sink"),
+            size: 16,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
         });
-        let marker = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("bevy_metal_timestamps_marker"),
-            layout: None,
-            module: &module,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let fallback = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("bevy_metal_timestamps_fallback"),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        let marker = marker_pipeline(
+            device,
+            "@group(0) @binding(0) var source: texture_2d<f32>;
+             @group(0) @binding(1) var<storage, read_write> sink: array<f32>;
+             @compute @workgroup_size(1) fn main() {
+                 sink[0] = textureLoad(source, vec2<u32>(0u), 0).x;
+             }",
+        );
+        let depth_marker = marker_pipeline(
+            device,
+            "@group(0) @binding(0) var source: texture_depth_2d_array;
+             @group(0) @binding(1) var<storage, read_write> sink: array<f32>;
+             @compute @workgroup_size(1) fn main() {
+                 sink[0] = textureLoad(source, vec2<u32>(0u), 0, 0);
+             }",
+        );
         Self {
             query_set,
             resolve,
             slots,
+            marks,
             marker,
+            depth_marker,
+            sink,
+            fallback,
             current: None,
             next: 0,
             period_ns: queue.get_timestamp_period(),
         }
     }
 
-    /// Encodes a marker pass: one no-op compute thread (real GPU work, so
-    /// Metal keeps the pass) with the requested timestamp writes. Compute
-    /// encoders sample at encoder start / end.
-    fn marker_pass(&self, encoder: &mut wgpu::CommandEncoder, label: &str, begin: Option<u32>, end: Option<u32>) {
+    /// Encodes one marker pass, sampling at its end: after the dispatches, so after
+    /// the writers of each source. Compute encoders sample at encoder start / end.
+    fn mark(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::ComputePipeline,
+        sources: &[&wgpu::TextureView],
+        query: u32,
+    ) {
+        let groups: Vec<wgpu::BindGroup> = sources
+            .iter()
+            .map(|source| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("bevy_metal_timestamps_marker"),
+                    layout: &pipeline.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(source),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: self.sink.as_entire_binding(),
+                        },
+                    ],
+                })
+            })
+            .collect();
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some(label),
+            label: Some("bevy_metal_timestamps_marker"),
             timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
                 query_set: &self.query_set,
-                beginning_of_pass_write_index: begin,
-                end_of_pass_write_index: end,
+                beginning_of_pass_write_index: None,
+                end_of_pass_write_index: Some(query),
             }),
         });
-        pass.set_pipeline(&self.marker);
-        pass.dispatch_workgroups(1, 1, 1);
+        pass.set_pipeline(pipeline);
+        for group in &groups {
+            pass.set_bind_group(0, group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
     }
 
-    /// Resolves slot `i`'s (begin, end) pair and copies it to its readback.
+    /// Resolves slot `i`'s marks and copies them to its readback.
     fn resolve_into_readback(&self, encoder: &mut wgpu::CommandEncoder, i: usize) {
-        let first = (2 * i) as u32;
-        encoder.resolve_query_set(&self.query_set, first..first + 2, &self.resolve, SLOT_STRIDE * i as u64);
+        let first = (self.marks * i) as u32;
+        encoder.resolve_query_set(
+            &self.query_set,
+            first..first + self.marks as u32,
+            &self.resolve,
+            SLOT_STRIDE * i as u64,
+        );
         encoder.copy_buffer_to_buffer(
             &self.resolve,
             SLOT_STRIDE * i as u64,
             &self.slots[i].readback,
             0,
-            2 * wgpu::QUERY_SIZE as u64,
+            self.marks as u64 * wgpu::QUERY_SIZE as u64,
         );
     }
 
-    /// Converts a resolved (begin, end) tick pair to milliseconds.
-    fn elapsed_ms(&self, begin: u64, end: u64) -> Option<f32> {
-        frame_ms(begin, end, self.period_ns)
+    /// Milliseconds between consecutive marks; `None` for a frame with a mark
+    /// unwritten or out of order.
+    fn spans_ms(&self, ticks: &[u64]) -> Option<Vec<f32>> {
+        ticks
+            .windows(2)
+            .map(|pair| frame_ms(pair[0], pair[1], self.period_ns))
+            .collect()
     }
+}
+
+fn marker_pipeline(device: &wgpu::Device, source: &str) -> wgpu::ComputePipeline {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("bevy_metal_timestamps_marker"),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("bevy_metal_timestamps_marker"),
+        layout: None,
+        module: &module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
+/// Each view's main texture, or the fallback when nothing renders this frame.
+fn frame_sources<'a>(timer: &'a Timer, views: &'a Query<&ViewTarget>) -> Vec<&'a wgpu::TextureView> {
+    let sources: Vec<&wgpu::TextureView> = views.iter().map(|v| &**v.main_texture_view()).collect();
+    if sources.is_empty() { vec![&timer.fallback] } else { sources }
 }
 
 /// `(end - begin)` ticks at `period_ns` per tick, in ms. `None` for an
@@ -314,29 +423,37 @@ fn collect_and_begin(
     timer: Option<ResMut<Timer>>,
     device: Res<RenderDevice>,
     shared: Res<Shared>,
+    views: Query<&ViewTarget>,
     mut pending: ResMut<PendingCommandBuffers>,
 ) {
     let Some(mut timer) = timer else { return };
-    let mut samples = Vec::new();
+    let mut samples: Vec<f32> = Vec::new();
+    let mut stages = Vec::new();
     for slot in &timer.slots {
         if slot.state.load(Ordering::Acquire) != READY {
             continue;
         }
-        let pair = match slot.readback.slice(..).get_mapped_range() {
-            Ok(view) => Some((
-                u64::from_le_bytes(view[0..8].try_into().unwrap()),
-                u64::from_le_bytes(view[8..16].try_into().unwrap()),
-            )),
+        let ticks: Option<Vec<u64>> = match slot.readback.slice(..).get_mapped_range() {
+            Ok(view) => Some(
+                view.chunks_exact(8)
+                    .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+                    .collect(),
+            ),
             Err(_) => None,
         };
         slot.readback.unmap();
         slot.state.store(FREE, Ordering::Release);
-        if let Some(ms) = pair.and_then(|(begin, end)| timer.elapsed_ms(begin, end)) {
-            samples.push(ms);
+        if let Some(spans) = ticks.and_then(|ticks| timer.spans_ms(&ticks)) {
+            samples.push(spans.iter().sum());
+            if spans.len() > 1 {
+                stages.push(spans);
+            }
         }
     }
     if !samples.is_empty() {
-        shared.0.lock().unwrap().samples.extend(samples);
+        let mut state = shared.0.lock().unwrap();
+        state.samples.extend(samples);
+        state.stages.extend(stages);
     }
 
     // Next free slot; skip this frame if every slot is still in flight.
@@ -349,14 +466,13 @@ fn collect_and_begin(
             break;
         }
     }
-    let mut encoder = device
-        .wgpu_device()
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("bevy_metal_timestamps_begin"),
-        });
+    let wgpu_device = device.wgpu_device();
+    let mut encoder = wgpu_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("bevy_metal_timestamps_begin"),
+    });
     // Resolve the slots whose end marker went out last frame. On Metal a
     // counter sampled at the end of a pass is NOT visible to a resolve in the
-    // same command buffer — that resolve returned the slot's previous end
+    // same command buffer: that resolve returned the slot's previous end
     // sample, one whole ring old (measured: end lagged begin by ~4 frames).
     // This encoder is the first command buffer of the next frame.
     for (j, slot) in timer.slots.iter().enumerate() {
@@ -367,26 +483,29 @@ fn collect_and_begin(
         slot.state.store(RESOLVED, Ordering::Release);
     }
     if let Some(i) = timer.current {
-        timer.marker_pass(&mut encoder, "bevy_metal_timestamps_begin", Some((2 * i) as u32), None);
+        let sources = frame_sources(&timer, &views);
+        timer.mark(wgpu_device, &mut encoder, &timer.marker, &sources, (timer.marks * i) as u32);
     }
     pending.push_encoder(encoder, "bevy_metal_timestamps_begin");
 }
 
-/// Closes the measurement with the end marker (the last command buffer of
-/// the frame) and resolves the pair into the slot's readback buffer.
+/// Closes the measurement with the end marker, the last command buffer of the
+/// frame.
 fn end_and_resolve(
     timer: Option<ResMut<Timer>>,
     device: Res<RenderDevice>,
+    views: Query<&ViewTarget>,
     mut pending: ResMut<PendingCommandBuffers>,
 ) {
     let Some(timer) = timer else { return };
     let Some(i) = timer.current else { return };
-    let mut encoder = device
-        .wgpu_device()
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("bevy_metal_timestamps_end"),
-        });
-    timer.marker_pass(&mut encoder, "bevy_metal_timestamps_end", None, Some((2 * i + 1) as u32));
+    let wgpu_device = device.wgpu_device();
+    let mut encoder = wgpu_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("bevy_metal_timestamps_end"),
+    });
+    let sources = frame_sources(&timer, &views);
+    let query = (timer.marks * i + timer.marks - 1) as u32;
+    timer.mark(wgpu_device, &mut encoder, &timer.marker, &sources, query);
     pending.push_encoder(encoder, "bevy_metal_timestamps_end");
     timer.slots[i].state.store(RECORDED, Ordering::Release);
 }

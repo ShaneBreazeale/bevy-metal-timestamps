@@ -29,15 +29,25 @@ It uses only what Metal supports — timestamps written at the **beginning / end
    command buffer) writes a timestamp at its start.
 2. **End marker** — a compute pass after `RenderGraphSystems::Render`, before `Submit` (the
    frame's last command buffer) writes a timestamp at its end.
-3. Command buffers execute in submission order, so `end − begin` is the GPU time of the whole
-   frame. The pair is resolved in the **next** frame's first command buffer and read back
-   asynchronously over a ring of 8 slots: measuring never stalls the frame; values arrive a
-   few frames late.
+3. Each marker **reads the view's main texture** and writes one shared buffer, and samples at the
+   end of its pass. Command buffers start in submission order, but passes with no shared resource
+   overlap freely: a free-standing marker ran early, and a saturated GPU read ~0 ms. The texture
+   read makes Metal wait for the frame's work; the shared buffer keeps the markers in order.
+4. `end − begin` is the GPU time of the frame. The marks are resolved in the **next** frame's first
+   command buffer and read back asynchronously over a ring of 8 slots: measuring never stalls the
+   frame; values arrive a few frames late. Measured cost on an M4: within run-to-run noise.
+
+### Per-stage time
+
+The `stages` feature adds `GpuStageTimesPlugin`: marks between Bevy's 3D stages give `GpuStageTimes`
+(shadows, opaque, transparent, post, rest). `shadows` runs from the frame's start, so it includes
+culling. Each mark makes its stage wait for the last, which costs GPU overlap and evens out less
+well (p90 up in testing), so it is for profiling, not shipping.
 
 ### Two Metal traps (both measured on an M4)
 
 * **An empty pass samples nothing.** Metal drops an encoder with no work, and its
-  timestamps read back as 0. Each marker dispatches one no-op compute thread.
+  timestamps read back as 0. Each marker dispatches one compute thread.
 * **An end-of-pass sample is not visible to a resolve in the same command buffer.** Resolving
   right after the end marker returned that slot's *previous* end sample — one full ring old
   (the end lagged the begin by exactly 4 frames with 4 slots; 85 % of samples came out
